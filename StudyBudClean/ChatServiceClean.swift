@@ -2,44 +2,52 @@ import Foundation
 import FirebaseAuth
 import FirebaseFirestore
 
-enum ChatServiceError: Error {
-    case notSignedIn
-    case threadNotFound
-}
-
 final class ChatServiceClean {
     static let shared = ChatServiceClean()
+    private let db = Firestore.firestore()
     private init() {}
 
-    private var db: Firestore { Firestore.firestore() }
-
-    /// Creates a new thread and makes the current user a member.
-    /// Returns the new threadId.
-    func createThread(name: String, isPublic: Bool = false,
-                      completion: @escaping (Result<String, Error>) -> Void) {
+    // Create a new thread and enroll the current user as a member.
+    // Also write the per-user mirror index: /user_threads/{uid}/threads/{threadId}
+    func createThread(name: String, completion: @escaping (Result<String, Error>) -> Void) {
         guard let uid = Auth.auth().currentUser?.uid else {
-            completion(.failure(ChatServiceError.notSignedIn)); return
+            completion(.failure(NSError(domain: "auth", code: 401,
+                                        userInfo: [NSLocalizedDescriptionKey: "Not signed in"])))
+            return
         }
 
         let threadRef = db.collection("threads").document()
-        let threadData: [String: Any] = [
-            "name": name,
-            "type": isPublic ? "public" : "private",
-            "createdBy": uid,
-            "createdAt": FieldValue.serverTimestamp(),
-            "lastMessagePreview": "",
-            "lastMessageAt": FieldValue.serverTimestamp()
-        ]
+        let now = Date()
 
-        // Write thread + membership in a single batch.
         let batch = db.batch()
-        batch.setData(threadData, forDocument: threadRef)
 
+        // Threads/{id}
+        batch.setData([
+            "name": name,
+            "type": "private",
+            "createdAt": Timestamp(date: now),
+            "createdBy": uid,
+            "lastMessageAt": Timestamp(date: now),
+            "lastMessagePreview": ""
+        ], forDocument: threadRef)
+
+        // Threads/{id}/members/{uid}
         let memberRef = threadRef.collection("members").document(uid)
         batch.setData([
-            "role": "member",
-            "joinedAt": FieldValue.serverTimestamp()
+            "joinedAt": Timestamp(date: now)
         ], forDocument: memberRef)
+
+        // user_threads/{uid}/threads/{id}  (mirror index row for current user)
+        let userIndexRef = db.collection("user_threads")
+            .document(uid)
+            .collection("threads")
+            .document(threadRef.documentID)
+
+        batch.setData([
+            "name": name,
+            "lastMessageAt": Timestamp(date: now),
+            "lastMessagePreview": ""
+        ], forDocument: userIndexRef, merge: true)
 
         batch.commit { error in
             if let error = error {
@@ -50,39 +58,61 @@ final class ChatServiceClean {
         }
     }
 
-    /// Sends a (plaintext) message to an existing thread.
-    /// (We’ll replace body with ciphertext when we add E2E.)
-    func sendMessage(threadId: String, text: String,
-                     completion: @escaping (Result<Void, Error>) -> Void) {
+    // Send a message to an existing thread.
+    // Updates thread metadata and the sender's mirror index row.
+    func sendMessage(threadId: String, text: String, completion: @escaping (Result<Void, Error>) -> Void) {
         guard let uid = Auth.auth().currentUser?.uid else {
-            completion(.failure(ChatServiceError.notSignedIn)); return
+            completion(.failure(NSError(domain: "auth", code: 401,
+                                        userInfo: [NSLocalizedDescriptionKey: "Not signed in"])))
+            return
         }
 
-        let msgRef = db.collection("threads").document(threadId)
-            .collection("messages").document()
-
-        let data: [String: Any] = [
-            "senderId": uid,
-            "body": text,                    // TODO: replace with ciphertext
-            "scheme": "plain-v0",            // TODO: update when encrypted
-            "sentAt": FieldValue.serverTimestamp()
-        ]
-
-        // Also update thread's lastMessage* metadata in a batch
+        let now = Date()
         let threadRef = db.collection("threads").document(threadId)
-        let batch = db.batch()
-        batch.setData(data, forDocument: msgRef)
-        batch.updateData([
-            "lastMessagePreview": String(text.prefix(80)),
-            "lastMessageAt": FieldValue.serverTimestamp()
-        ], forDocument: threadRef)
+        let messageRef = threadRef.collection("messages").document()
 
-        batch.commit { error in
-            if let error = error {
-                completion(.failure(error))
-            } else {
-                completion(.success(()))
+        // Use a transaction to append message + update thread metadata atomically
+        db.runTransaction({ (txn, errorPointer) -> Any? in
+            txn.setData([
+                "text": text,
+                "senderId": uid,
+                "sentAt": Timestamp(date: now)
+            ], forDocument: messageRef)
+
+            txn.updateData([
+                "lastMessageAt": Timestamp(date: now),
+                "lastMessagePreview": text
+            ], forDocument: threadRef)
+
+            return nil
+        }) { (_, txError) in
+            if let txError = txError {
+                completion(.failure(txError))
+                return
+            }
+
+            // After metadata update, mirror to the current user's index row.
+            threadRef.getDocument { snap, _ in
+                let name = (snap?.data()?["name"] as? String) ?? "Untitled"
+
+                let indexRef = self.db.collection("user_threads")
+                    .document(uid)
+                    .collection("threads")
+                    .document(threadId)
+
+                indexRef.setData([
+                    "name": name,
+                    "lastMessageAt": Timestamp(date: now),
+                    "lastMessagePreview": text
+                ], merge: true) { err in
+                    if let err = err {
+                        completion(.failure(err))
+                    } else {
+                        completion(.success(()))
+                    }
+                }
             }
         }
     }
 }
+

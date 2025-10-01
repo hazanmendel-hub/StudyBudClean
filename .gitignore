@@ -1,0 +1,23 @@
+# macOS
+.DS_Store
+
+# Xcode user data
+xcuserdata/
+*.xcuserstate
+
+# Build outputs
+build/
+DerivedData/
+
+# SwiftPM (keep Package.resolved; ignore user data)
+.swiftpm/xcode/package.xcworkspace/xcuserdata/
+
+# Legacy CocoaPods (if leftovers ever reappear)
+Pods/
+Podfile.lock
+
+# Carthage (not used, harmless)
+Carthage/Build/
+
+# If you make the repo PUBLIC later, uncomment the next line and commit a sample instead
+# GoogleService-Info.plist

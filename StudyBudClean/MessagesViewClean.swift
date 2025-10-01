@@ -1,12 +1,12 @@
 import SwiftUI
 import FirebaseFirestore
 
-// MARK: - Models
+// MARK: - Model
 
 struct ChatMessage: Identifiable {
     let id: String
     let senderId: String
-    let body: String        // UI uses `body`; Firestore stores this under key "text"
+    let body: String        // Firestore key = "text"
     let sentAt: Date
 }
 
@@ -19,8 +19,19 @@ struct MessagesViewClean: View {
     @State private var input: String = ""
     @State private var listener: ListenerRegistration?
 
+    @State private var isMember: Bool? = nil
+    @State private var membershipBusy = false
+
     var body: some View {
         VStack(spacing: 0) {
+            if isMember == false {
+                // Banner shown when user is not a member
+                Text("You’re not a member of this thread. Join to read & send messages.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .padding()
+            }
+
             // Messages
             List(messages) { m in
                 VStack(alignment: .leading, spacing: 4) {
@@ -45,24 +56,94 @@ struct MessagesViewClean: View {
                 } label: {
                     Image(systemName: "paperplane.fill")
                 }
-                .disabled(input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                .disabled(!(isMember ?? false) ||
+                          input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
             .padding()
         }
         .navigationTitle("Thread")
         .navigationBarTitleDisplayMode(.inline)
-        .onAppear { attachListener() }
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                if let member = isMember {
+                    Button {
+                        toggleMembership(isCurrentlyMember: member)
+                    } label: {
+                        HStack(spacing: 6) {
+                            if membershipBusy { ProgressView() }
+                            Text(member ? "Leave" : "Join")
+                        }
+                    }
+                    .disabled(membershipBusy)
+                } else {
+                    ProgressView()
+                }
+            }
+        }
+        .onAppear {
+            refreshMembership()
+        }
         .onDisappear {
-            listener?.remove()
-            listener = nil
+            detachListener()
+        }
+    }
+
+    // MARK: - Membership
+
+    private func refreshMembership() {
+        ChatServiceClean.shared.isMember(of: threadId) { member in
+            DispatchQueue.main.async {
+                self.isMember = member
+                if member {
+                    self.attachListener()
+                } else {
+                    self.detachListener()
+                    self.messages = []
+                }
+            }
+        }
+    }
+
+    private func toggleMembership(isCurrentlyMember: Bool) {
+        membershipBusy = true
+        if isCurrentlyMember {
+            ChatServiceClean.shared.leaveThread(threadId: threadId) { result in
+                DispatchQueue.main.async {
+                    self.membershipBusy = false
+                    switch result {
+                    case .success:
+                        self.isMember = false
+                        self.detachListener()
+                        self.messages = []
+                    case .failure:
+                        // Keep UI state unchanged on failure
+                        break
+                    }
+                }
+            }
+        } else {
+            ChatServiceClean.shared.joinThread(threadId: threadId) { result in
+                DispatchQueue.main.async {
+                    self.membershipBusy = false
+                    switch result {
+                    case .success:
+                        self.isMember = true
+                        self.attachListener()
+                    case .failure:
+                        // Keep UI state unchanged on failure
+                        break
+                    }
+                }
+            }
         }
     }
 
     // MARK: - Firestore listeners
 
     private func attachListener() {
-        let db = Firestore.firestore()
+        detachListener() // avoid double listeners
 
+        let db = Firestore.firestore()
         listener = db.collection("threads")
             .document(threadId)
             .collection("messages")
@@ -73,36 +154,36 @@ struct MessagesViewClean: View {
 
                 let newMessages: [ChatMessage] = docs.compactMap { d in
                     let data = d.data()
-
-                    // 🔑 Firestore keys: "text", "senderId", "sentAt"
-                    let text = data["text"] as? String ?? "" // <- map to UI `body`
+                    let text = data["text"] as? String ?? ""          // 🔑 Firestore key
                     let sender = data["senderId"] as? String ?? "?"
-                    let sentAt = (data["sentAt"] as? Timestamp)?.dateValue() ?? Date.distantPast
+                    let sentAt = (data["sentAt"] as? Timestamp)?.dateValue() ?? .distantPast
 
-                    return ChatMessage(
-                        id: d.documentID,
-                        senderId: sender,
-                        body: text,
-                        sentAt: sentAt
-                    )
+                    return ChatMessage(id: d.documentID,
+                                       senderId: sender,
+                                       body: text,
+                                       sentAt: sentAt)
                 }
 
-                // Always update UI on the main queue
                 DispatchQueue.main.async {
                     self.messages = newMessages
                 }
             }
     }
 
+    private func detachListener() {
+        listener?.remove()
+        listener = nil
+    }
+
     // MARK: - Sending
 
     private func send() {
         let text = input.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty else { return }
+        guard !(text.isEmpty), isMember == true else { return }
         input = ""
-
-        // Listener will update the list; we can ignore the result here.
-        ChatServiceClean.shared.sendMessage(threadId: threadId, text: text) { _ in }
+        ChatServiceClean.shared.sendMessage(threadId: threadId, text: text) { _ in
+            // no-op; listener will refresh
+        }
     }
 }
 

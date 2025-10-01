@@ -98,7 +98,7 @@ struct ContentView: View {
 
     private func createThread() {
         status = "🛠️ Creating thread…"
-        ChatServiceClean.shared.createThread(name: threadName, isPublic: false) { result in
+        ChatServiceClean.shared.createThread(name: threadName) { result in
             DispatchQueue.main.async {
                 switch result {
                 case .failure(let error):
